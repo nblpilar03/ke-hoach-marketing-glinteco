@@ -48,6 +48,12 @@ table.plan tbody td:first-child[contenteditable="true"]:focus{background:#fffdf4
 #bar button.primary:hover{background:#000}
 #bar button.primary.dirty{background:var(--g)}
 #bar button.primary.dirty:hover{background:var(--g-dark)}
+#stat{display:flex;align-items:center;gap:7px;padding:0 12px 0 10px;font-size:12px;font-weight:600;color:var(--ink3);border-right:1px solid var(--line);margin-right:2px;white-space:nowrap}
+#stat .dot{width:7px;height:7px;border-radius:50%;background:var(--ink4);flex:none}
+#stat.ok{color:var(--g-deep)}
+#stat.ok .dot{background:var(--g);box-shadow:0 0 0 3px rgba(22,193,49,.16)}
+#stat.warn{color:#8a5a00}
+#stat.warn .dot{background:var(--amber)}
 
 /* ══ PIC cells ══ */
 td.pic{cursor:pointer;position:relative;padding-right:22px !important}
@@ -1040,6 +1046,7 @@ table.plan tbody tr:hover td:first-child{background:#fbfdfb}
 </div>
 
 <div id="bar">
+  <span id="stat"><span class="dot"></span><span id="statTxt">Đang kết nối…</span></span>
   <button id="btnReset" onclick="resetAll()" title="Xoá mọi thay đổi, quay về bản gốc">↺</button>
   <button onclick="exportSheet()">⊞ Xuất Google Sheets</button>
   <button id="btnSave" class="primary" onclick="saveState()">✓ Lưu thay đổi</button>
@@ -1231,20 +1238,36 @@ function addRow(btn){
   tr.cells[1].focus();
 }
 
-/* ─────────── lưu thay đổi vào trình duyệt ─────────── */
+/* ─────────── lưu & đồng bộ ─────────── */
 var KEY = 'glinteco-plan-v1';
-var ORIGINAL = null;
-var storageOK = true;
+var API = '/api/state';
+var ORIGINAL = null, mode = 'local', rev = 0, storageOK = true;
+var saveTimer = null, pollTimer = null, editKey = '';
+
 try { localStorage.setItem('__t','1'); localStorage.removeItem('__t'); } catch(e){ storageOK = false; }
+try { editKey = localStorage.getItem('glinteco-plan-key') || ''; } catch(e){}
 
 function bodies(){ return document.querySelectorAll('#s7 .week table.plan tbody'); }
+function two(n){ return n<10 ? '0'+n : ''+n; }
+function hhmm(){ var d = new Date(); return two(d.getHours())+':'+two(d.getMinutes()); }
 
+function setStat(txt, cls){
+  var el = document.getElementById('stat');
+  var t  = document.getElementById('statTxt');
+  if (t) t.textContent = txt;
+  if (el) el.className = cls || '';
+}
+function cleanBtn(){
+  var b = document.getElementById('btnSave');
+  if (b){ b.classList.remove('dirty'); b.textContent = '✓ Lưu thay đổi'; }
+}
 function markDirty(){
   dirty = true;
   var b = document.getElementById('btnSave');
   if (b){ b.classList.add('dirty'); b.textContent = '✓ Lưu thay đổi •'; }
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(function(){ save(true); }, 1500);
 }
-function two(n){ return n<10 ? '0'+n : ''+n; }
 
 function captureOriginal(){
   var bs = bodies(), arr = [];
@@ -1254,7 +1277,7 @@ function captureOriginal(){
 function snapshot(){
   var bs = bodies(), arr = [];
   for (var i=0;i<bs.length;i++){ arr.push(bs[i].innerHTML); }
-  return { v:1, roster: roster, bodies: arr, ts: Date.now() };
+  return { v:1, roster: roster, bodies: arr };
 }
 function applySnapshot(s){
   if (!s) return false;
@@ -1262,50 +1285,141 @@ function applySnapshot(s){
   if (s.bodies && s.bodies.length === bs.length){
     for (var i=0;i<bs.length;i++){ bs[i].innerHTML = s.bodies[i]; }
   }
-  if (s.roster && s.roster.length) roster = s.roster;
+  if (s.roster && s.roster.length) roster = JSON.parse(JSON.stringify(s.roster));
   initTables();
   renderAllPic();
   return true;
 }
-function saveState(){
-  if (!storageOK){
-    flash('Trình duyệt đang chặn lưu trữ. Hãy mở file này trực tiếp trong Chrome thay vì xem trong khung xem trước.');
-    return;
-  }
-  try {
-    localStorage.setItem(KEY, JSON.stringify(snapshot()));
-    dirty = false;
-    var b = document.getElementById('btnSave');
-    b.classList.remove('dirty'); b.textContent = '✓ Lưu thay đổi';
-    var d = new Date();
-    flash('Đã lưu lúc ' + two(d.getHours()) + ':' + two(d.getMinutes()) + '. Tải lại trang hay đóng mở lại vẫn còn nguyên.');
-  } catch(e){
-    flash('Không lưu được - bộ nhớ trình duyệt đã đầy hoặc bị chặn.');
-  }
+function note(txt){
+  var n = document.getElementById('savedNote');
+  if (n) n.textContent = txt || '';
 }
-function restoreState(){
+
+/* khởi động: thử nối server, không được thì lưu trên máy */
+function boot(){
+  initTables();
+  captureOriginal();
+  fetch(API, { cache:'no-store' })
+    .then(function(r){ if(!r.ok) throw 0; return r.json(); })
+    .then(function(j){
+      mode = 'server';
+      rev = j.rev || 0;
+      if (j.data) applySnapshot(j.data);
+      setStat(rev ? 'Đồng bộ chung · bản #'+rev : 'Đồng bộ chung', 'ok');
+      note(' Mọi người cùng xem và sửa chung một bản trên link này.');
+      pollTimer = setInterval(poll, 20000);
+    })
+    .catch(function(){
+      mode = 'local';
+      restoreLocal();
+      if (storageOK){
+        setStat('Lưu trên máy này', 'warn');
+        note(' Chưa nối được server nên thay đổi chỉ lưu trên máy này.');
+      } else {
+        setStat('Không lưu được', 'warn');
+        note(' Đang xem trong khung xem trước nên không lưu được. Mở link đầy đủ trong trình duyệt.');
+      }
+    });
+}
+
+function poll(){
+  if (dirty || mode !== 'server') return;
+  fetch(API, { cache:'no-store' })
+    .then(function(r){ return r.ok ? r.json() : null; })
+    .then(function(j){
+      if (j && j.rev > rev && j.data){
+        rev = j.rev;
+        applySnapshot(j.data);
+        setStat('Vừa cập nhật từ người khác · #'+rev, 'ok');
+      }
+    })
+    .catch(function(){});
+}
+
+function saveState(){ save(false); }
+
+function save(auto){
+  if (mode !== 'server'){ saveLocal(); return; }
+  setStat('Đang lưu…', 'ok');
+  fetch(API, {
+    method: 'POST',
+    headers: { 'Content-Type':'application/json', 'x-edit-key': editKey },
+    body: JSON.stringify({ baseRev: rev, data: snapshot() })
+  })
+  .then(function(res){
+    if (res.status === 401){
+      var k = prompt('Nhập mật khẩu chỉnh sửa:');
+      if (k){
+        editKey = k;
+        try { localStorage.setItem('glinteco-plan-key', k); } catch(e){}
+        save(auto);
+      } else {
+        setStat('Cần mật khẩu', 'warn');
+      }
+      return null;
+    }
+    if (res.status === 409){
+      return res.json().then(function(j){
+        var takeTheirs = confirm(
+          'Có người vừa lưu bản mới hơn.\n\n' +
+          'OK  = lấy bản của họ (bỏ thay đổi của bạn)\n' +
+          'Cancel = giữ và ghi đè bằng bản của bạn'
+        );
+        if (takeTheirs){
+          rev = j.rev; applySnapshot(j.data);
+          dirty = false; cleanBtn();
+          setStat('Đã lấy bản mới nhất · #'+rev, 'ok');
+        } else {
+          rev = j.rev; save(auto);
+        }
+        return null;
+      });
+    }
+    if (!res.ok) throw 0;
+    return res.json();
+  })
+  .then(function(out){
+    if (!out) return;
+    rev = out.rev;
+    dirty = false; cleanBtn();
+    setStat('Đã lưu ' + hhmm() + ' · #' + rev, 'ok');
+  })
+  .catch(function(){
+    setStat('Lưu thất bại', 'warn');
+  });
+}
+
+/* dự phòng khi mở file rời, không có server */
+function saveLocal(){
+  if (!storageOK){ flash('Trình duyệt đang chặn lưu trữ.'); return; }
+  try {
+    localStorage.setItem(KEY, JSON.stringify({ ts: Date.now(), data: snapshot() }));
+    dirty = false; cleanBtn();
+    setStat('Đã lưu ' + hhmm() + ' · máy này', 'warn');
+  } catch(e){ setStat('Lưu thất bại', 'warn'); }
+}
+function restoreLocal(){
   if (!storageOK) return;
   try {
     var raw = localStorage.getItem(KEY);
     if (!raw) return;
     var s = JSON.parse(raw);
-    if (applySnapshot(s) && s.ts){
-      var d = new Date(s.ts);
-      var note = document.getElementById('savedNote');
-      if (note) note.textContent = ' Đang hiển thị bản đã lưu lúc ' + two(d.getHours()) + ':' + two(d.getMinutes()) + ' ngày ' + d.getDate() + '/' + (d.getMonth()+1) + '.';
-    }
+    applySnapshot(s.data || s);
   } catch(e){}
 }
+
 function resetAll(){
-  if (!confirm('Xoá mọi thay đổi đã lưu và quay về bản gốc?')) return;
-  try { localStorage.removeItem(KEY); } catch(e){}
+  if (!confirm('Xoá mọi thay đổi và quay về bản gốc?')) return;
   applySnapshot(ORIGINAL);
-  dirty = false;
-  var b = document.getElementById('btnSave');
-  b.classList.remove('dirty'); b.textContent = '✓ Lưu thay đổi';
-  var note = document.getElementById('savedNote'); if (note) note.textContent = '';
+  dirty = false; cleanBtn();
+  if (mode === 'server'){ save(false); }
+  else {
+    try { localStorage.removeItem(KEY); } catch(e){}
+    setStat('Đã về bản gốc', 'warn');
+  }
   flash('Đã quay về bản gốc.');
 }
+
 function download(content, name, mime){
   var blob = new Blob([content], {type: mime + ';charset=utf-8'});
   var url = URL.createObjectURL(blob);
@@ -1377,13 +1491,7 @@ function flash(msg){
 
 window.addEventListener('beforeunload', function(e){ if(dirty){ e.preventDefault(); e.returnValue=''; } });
 
-initTables();
-captureOriginal();
-restoreState();
-if (!storageOK){
-  var n = document.getElementById('savedNote');
-  if (n) n.textContent = ' Lưu ý: đang xem trong khung xem trước nên không lưu được - tải file về và mở bằng Chrome để dùng nút Lưu thay đổi.';
-}
+boot();
 </script>
 </body>
 </html>

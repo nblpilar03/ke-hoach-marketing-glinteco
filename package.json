@@ -1,0 +1,7 @@
+{
+  "name": "glinteco-content-plan",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Ke hoach tuyen bai Glinteco - trang tinh co dong bo chung",
+  "type": "module"
+}
